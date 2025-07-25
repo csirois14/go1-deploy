@@ -15,6 +15,7 @@ This repo can be deployed in the following configurations:
 - other dependencies for unitree_legged_sdk
 
 # Installation 
+
 On the target machine run the following commands
 1. `git clone https://github.com/fgolemo/go1-deploy`  
 2. `cd go1-deploy`
@@ -44,5 +45,16 @@ On the target machine run the following commands
 2. While suspended, please wait for the robot to reach a standing pose (2-3 Seconds) and then slowly put the robot back on the ground
 3. Do not operate the joystick or the robot until the counter on the screen reaches 2300, after the counter reaches 2300 you can move the robot around. 
 4. Left joystick can be used for giving linear velocity commands, the right joystick can be used to give yaw commands.
+
+
+## Conda Env
+
+```
+conda create -n go1 python=3.8
+```
+
+```
+pip3 install torch --index-url https://download.pytorch.org/whl/cu118 
+```
 
 
