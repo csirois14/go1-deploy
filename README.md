@@ -47,6 +47,37 @@ On the target machine run the following commands
 4. Left joystick can be used for giving linear velocity commands, the right joystick can be used to give yaw commands.
 
 
+## External Policy Mode
+
+The system now supports external policy mode where actions are computed externally and sent to the robot via TCP commands, instead of using the onboard policy.
+
+### Usage
+
+1. **Start robot in external policy mode:**
+   ```bash
+   python deploy.py --server --external-policy
+   ```
+
+2. **Send actions from external controller:**
+   - The robot will receive observations and send them to connected clients
+   - Clients must send action commands (12 joint angles) via TCP
+   - Use `test_external_policy.py` for a simple example
+
+### Message Format
+
+**Action Commands** (50 bytes):
+- Code: 2 (short, 2 bytes) 
+- Actions: 12 floats (48 bytes) - joint angles for each motor
+
+**Velocity Commands** (14 bytes) - still supported:
+- Code: 1 (short, 2 bytes)
+- x, y, r: 3 floats (12 bytes) - linear and angular velocities
+
+### Test Scripts
+
+- `test_external_policy.py` - Simple action command sender
+- `test_bidirectional_comm.py` - Bidirectional communication test with both velocity and action commands
+
 ## Conda Env
 
 ```
@@ -58,3 +89,4 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 ```
 
 
+## Laptop Setup

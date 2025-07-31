@@ -118,6 +118,7 @@ class ZMQCameraPublisher:
                 except socket.timeout:
                     if self.running:
                         continue
+
                 except Exception as e:
                     if self.running:
                         print(f"Error reading frame: {e}")

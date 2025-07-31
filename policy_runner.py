@@ -50,7 +50,7 @@ import socket
 import struct
 from threading import Thread, Lock
 
-from actor_critic import ActorCritic
+from _old.actor_critic import ActorCritic
 # from LinearKalmanFilter import LinearKFPositionVelocityEstimator
 # from FastLinearKF import FastLinearKFPositionVelocityEstimator
 
@@ -59,8 +59,17 @@ sys.path.append("unitree_legged_sdk/lib/python/amd64")
 import robot_interface as sdk
 
 
-MSG_LEN = 14  # 1 short, 3 float (4 bytes each)
+MSG_LEN = 14  # 1 short, 3 float (4 bytes each) - for velocity commands
+ACTION_MSG_LEN = 50  # 1 short, 12 float (4 bytes each) - for action commands
 START_IDLE_TIME = 1100  # TODO: 1100
+
+# Message codes
+CMD_CODE_VELOCITY = 1  # Velocity command message
+CMD_CODE_ACTION = 2    # Action command message
+
+# Observation message format: 1 byte for obs_count + obs_count * 4 bytes for floats
+MAX_OBS_COUNT = 100  # Maximum number of observations to send
+OBS_MSG_HEADER_LEN = 1  # 1 byte for observation count
 
 
 class CommandServer:
@@ -70,6 +79,9 @@ class CommandServer:
         self.__x = 0
         self.__y = 0
         self.__r = 0
+        self.__actions = torch.zeros(12, dtype=torch.float)  # Last received actions
+        self._current_connection = None
+        self._connection_lock = Lock()
 
         self._s_thread = Thread(target=self._server_thread, args=(port,), daemon=True)
         self._s_thread.start()
@@ -83,45 +95,127 @@ class CommandServer:
             while c:
                 conn, addr = s.accept()
                 with conn:
-                    # print(f"Connected by {addr}")
-                    while True:
-                        data = conn.recv(1024)
-                        # print(len(data))
-                        if not data:
-                            # broken connection
-                            with self._lock:
-                                self.__code, self.__x, self.__y, self.__r = -1, 0, 0, 0
-                            break
-                        buffer += data
-                        while len(buffer) >= MSG_LEN:
-                            msg = buffer[:MSG_LEN]
-                            buffer = buffer[MSG_LEN:]
-                            code, x, y, r = struct.unpack("<hfff", msg)
-                            with self._lock:
-                                self.__code, self.__x, self.__y, self.__r = code, x, y, r
-                            if code <= 0:
-                                # clean exit
+                    print(f"Connected by {addr}")
+                    # Store current connection for sending observations
+                    with self._connection_lock:
+                        self._current_connection = conn
+
+                    try:
+                        while True:
+                            data = conn.recv(1024)
+                            if not data:
+                                # broken connection
                                 with self._lock:
-                                    self.__code, self.__x, self.__y, self.__r = code, 0, 0, 0
-                                if code < 0:
-                                    # shutdown request
-                                    c = False
+                                    self.__code, self.__x, self.__y, self.__r = -1, 0, 0, 0
                                 break
-        # print("closing server")
+                            buffer += data
+                            
+                            # Process messages based on their length
+                            while len(buffer) >= 2:  # At least enough for the code
+                                # Peek at the code to determine message type
+                                code = struct.unpack("<h", buffer[:2])[0]
+                                
+                                if code == CMD_CODE_VELOCITY and len(buffer) >= MSG_LEN:
+                                    # Process velocity command
+                                    msg = buffer[:MSG_LEN]
+                                    buffer = buffer[MSG_LEN:]
+                                    code, x, y, r = struct.unpack("<hfff", msg)
+                                    with self._lock:
+                                        self.__code, self.__x, self.__y, self.__r = code, x, y, r
+                                        
+                                elif code == CMD_CODE_ACTION and len(buffer) >= ACTION_MSG_LEN:
+                                    # Process action command
+                                    msg = buffer[:ACTION_MSG_LEN]
+                                    buffer = buffer[ACTION_MSG_LEN:]
+                                    unpacked = struct.unpack("<h12f", msg)
+                                    code = unpacked[0]
+                                    actions = torch.tensor(unpacked[1:], dtype=torch.float)
+                                    with self._lock:
+                                        self.__code = code
+                                        self.__actions = actions
+                                        
+                                elif code <= 0:
+                                    # Handle exit codes
+                                    if len(buffer) >= MSG_LEN:
+                                        msg = buffer[:MSG_LEN]
+                                        buffer = buffer[MSG_LEN:]
+                                        code, x, y, r = struct.unpack("<hfff", msg)
+                                        with self._lock:
+                                            self.__code, self.__x, self.__y, self.__r = code, 0, 0, 0
+                                        if code < 0:
+                                            c = False
+                                        break
+                                    else:
+                                        break
+                                else:
+                                    # Unknown message type or incomplete message
+                                    break
+                                    
+                    finally:
+                        # Clear connection when client disconnects
+                        with self._connection_lock:
+                            self._current_connection = None
+                        print("Client disconnected")
 
     def get(self):
         with self._lock:
             x, y, r = self.__x, self.__y, self.__r
         return x, y, r
+        
+    def get_actions(self):
+        """Get the last received actions for external policy mode"""
+        with self._lock:
+            return self.__actions.clone()
+
+    def send_observations(self, observations):
+        """
+        Send observations back to the connected client.
+
+        Args:
+            observations: torch.Tensor or numpy array of observations
+        """
+        with self._connection_lock:
+            if self._current_connection is None:
+                return False  # No client connected
+
+            try:
+                # Convert observations to numpy if it's a torch tensor
+                if hasattr(observations, "cpu"):
+                    obs_array = observations.cpu().detach().numpy()
+                else:
+                    obs_array = np.array(observations)
+
+                # Flatten the array and limit to MAX_OBS_COUNT
+                obs_flat = obs_array.flatten()
+                if len(obs_flat) > MAX_OBS_COUNT:
+                    obs_flat = obs_flat[:MAX_OBS_COUNT]
+
+                # Create message: 1 byte for count + floats
+                obs_count = len(obs_flat)
+                msg = struct.pack("B", obs_count)  # 1 byte for count
+                msg += struct.pack(f"{obs_count}f", *obs_flat)  # floats
+
+                self._current_connection.sendall(msg)
+                return True
+
+            except (socket.error, struct.error, OSError) as e:
+                print(f"Error sending observations: {e}")
+                # Clear connection on error
+                self._current_connection = None
+                return False
 
 
 class PolicyRunner:
-    def __init__(self, path, server=False, port=9292, joystick=True):
+    def __init__(self, path, server=False, port=9292, joystick=True, external_policy=False):
         self.joystick = joystick
         self.server = server
+        self.external_policy = external_policy
 
-        # load the policy
-        self.policy = self._load_policy(path)
+        # load the policy (skip if using external policy)
+        if not external_policy:
+            self.policy = self._load_policy(path)
+        else:
+            self.policy = None
 
         if server:
             self.command_server = CommandServer(port)
@@ -392,6 +486,10 @@ class PolicyRunner:
             if self.motiontime > START_IDLE_TIME:
                 self.init = False
 
+            # TODO: debugging
+            # if self.server and self.command_server:
+            #     self.command_server.send_observations(self.obs)
+
             self.post_step()
 
         print("Starting")
@@ -437,8 +535,17 @@ class PolicyRunner:
         calls post_step
         """
         self.get_observations()
-        self.actions = self.policy(self.obs)
+
+        # Get actions either from policy or from external command server
+        if self.external_policy and self.server and self.command_server:
+            # Use actions from external policy
+            self.actions = self.command_server.get_actions()
+        else:
+            # Use local policy
+            self.actions = self.policy(self.obs)
+            
         actions = torch.clip(self.actions, -100, 100).to("cpu").detach()
+
         scaled_actions = actions * self.action_scale
         final_angles = scaled_actions + self.default_angles_tensor
         des_angles = scaled_actions + self.default_angles_tensor
@@ -455,6 +562,10 @@ class PolicyRunner:
         # print(f"Scaled actions: {scaled_actions.numpy().tolist()}")
 
         # print("observations:" + str(time.process_time()) + ",".join(map(str, self.obs.detach().numpy().tolist())))
+
+        # Send observations to controller (if server mode and client is connected)
+        if self.server and self.command_server:
+            self.command_server.send_observations(self.obs)
 
         # Send joint commands
         self.setJointValues(angles=final_angles, kp=20, kd=0.5)
