@@ -25,10 +25,9 @@
 
 
 """
-Modified by Yann Bouteiller.
+Modified by Yann Bouteiller and Charles Sirois.
 
 This version features a local server that takes in velocity commands.
-If the server kwarg is False (default), the behavior is the same as agent2.py.
 If the server kwarg is True, joystick commands for X, Y, YAW are ignored and instead provided by a local server.
 The port can be set using the port kwarg.
 """
@@ -58,14 +57,13 @@ sys.path.append("unitree_legged_sdk/lib/python/arm64")
 sys.path.append("unitree_legged_sdk/lib/python/amd64")
 import robot_interface as sdk
 
-
 MSG_LEN = 14  # 1 short, 3 float (4 bytes each) - for velocity commands
 ACTION_MSG_LEN = 50  # 1 short, 12 float (4 bytes each) - for action commands
-START_IDLE_TIME = 1100  # TODO: 1100
+START_IDLE_TIME = 1100  # reccommended: 1100
 
 # Message codes
 CMD_CODE_VELOCITY = 1  # Velocity command message
-CMD_CODE_ACTION = 2    # Action command message
+CMD_CODE_ACTION = 2  # Action command message
 
 # Observation message format: 1 byte for obs_count + obs_count * 4 bytes for floats
 MAX_OBS_COUNT = 100  # Maximum number of observations to send
@@ -109,12 +107,12 @@ class CommandServer:
                                     self.__code, self.__x, self.__y, self.__r = -1, 0, 0, 0
                                 break
                             buffer += data
-                            
+
                             # Process messages based on their length
                             while len(buffer) >= 2:  # At least enough for the code
                                 # Peek at the code to determine message type
                                 code = struct.unpack("<h", buffer[:2])[0]
-                                
+
                                 if code == CMD_CODE_VELOCITY and len(buffer) >= MSG_LEN:
                                     # Process velocity command
                                     msg = buffer[:MSG_LEN]
@@ -122,7 +120,7 @@ class CommandServer:
                                     code, x, y, r = struct.unpack("<hfff", msg)
                                     with self._lock:
                                         self.__code, self.__x, self.__y, self.__r = code, x, y, r
-                                        
+
                                 elif code == CMD_CODE_ACTION and len(buffer) >= ACTION_MSG_LEN:
                                     # Process action command
                                     msg = buffer[:ACTION_MSG_LEN]
@@ -133,7 +131,7 @@ class CommandServer:
                                     with self._lock:
                                         self.__code = code
                                         self.__actions = actions
-                                        
+
                                 elif code <= 0:
                                     # Handle exit codes
                                     if len(buffer) >= MSG_LEN:
@@ -150,7 +148,7 @@ class CommandServer:
                                 else:
                                     # Unknown message type or incomplete message
                                     break
-                                    
+
                     finally:
                         # Clear connection when client disconnects
                         with self._connection_lock:
@@ -161,8 +159,8 @@ class CommandServer:
         with self._lock:
             x, y, r = self.__x, self.__y, self.__r
         return x, y, r
-        
-    def get_actions(self):
+
+    def get_actions(self) -> torch.Tensor:
         """Get the last received actions for external policy mode"""
         with self._lock:
             return self.__actions.clone()
@@ -179,11 +177,21 @@ class CommandServer:
                 return False  # No client connected
 
             try:
+                # TODO: This was crashing last time, because the numpy version on the robot was too old. I tried a fix, but can't test it
                 # Convert observations to numpy if it's a torch tensor
-                if hasattr(observations, "cpu"):
-                    obs_array = observations.cpu().detach().numpy()
+                if hasattr(observations, "detach"):
+                    # PyTorch tensor - use manual conversion to avoid numpy integration issues
+                    obs_array = observations.detach().cpu().tolist()
+                    obs_array = np.array(obs_array, dtype=np.float32)
+
+                elif hasattr(observations, "cpu"):
+                    # PyTorch tensor without gradients
+                    obs_array = observations.cpu().tolist()
+                    obs_array = np.array(obs_array, dtype=np.float32)
+
                 else:
-                    obs_array = np.array(observations)
+                    # Already a numpy array or list
+                    obs_array = np.array(observations, dtype=np.float32)
 
                 # Flatten the array and limit to MAX_OBS_COUNT
                 obs_flat = obs_array.flatten()
@@ -203,11 +211,44 @@ class CommandServer:
                 # Clear connection on error
                 self._current_connection = None
                 return False
+            except Exception as e:
+                print(f"Error converting observations to numpy: {e}")
+                # Try alternative approach - send as list
+                try:
+                    if hasattr(observations, "tolist"):
+                        obs_list = observations.tolist()
+                    else:
+                        obs_list = list(observations)
+
+                    # Flatten and limit
+                    def flatten_list(lst):
+                        result = []
+                        for item in lst:
+                            if isinstance(item, (list, tuple)):
+                                result.extend(flatten_list(item))
+                            else:
+                                result.append(float(item))
+                        return result
+
+                    obs_flat = flatten_list(obs_list)
+                    if len(obs_flat) > MAX_OBS_COUNT:
+                        obs_flat = obs_flat[:MAX_OBS_COUNT]
+
+                    # Create message
+                    obs_count = len(obs_flat)
+                    msg = struct.pack("B", obs_count)
+                    msg += struct.pack(f"{obs_count}f", *obs_flat)
+
+                    self._current_connection.sendall(msg)
+                    return True
+
+                except Exception as e2:
+                    print(f"Fallback method also failed: {e2}")
+                    return False
 
 
 class PolicyRunner:
-    def __init__(self, path, server=False, port=9292, joystick=True, external_policy=False):
-        self.joystick = joystick
+    def __init__(self, path, server=False, port=9292, external_policy=False):
         self.server = server
         self.external_policy = external_policy
 
@@ -265,7 +306,7 @@ class PolicyRunner:
 
         self.finish_rec = 0
         self.leg_data_buffer = []
-        self.csv_filename = "joint_angles.csv"
+        self.csv_filename = "data/joint_angles.csv"
 
         #####################################################################
         self.euler = np.zeros(3)
@@ -307,8 +348,10 @@ class PolicyRunner:
         )
 
         self.action_scale = 0.25
-        self.actions = torch.zeros(self.num_actions, device=self.device, dtype=torch.float, requires_grad=False)
-        self.obs = torch.zeros(self.num_obs, device=self.device, dtype=torch.float, requires_grad=False)
+        self.actions: torch.Tensor = torch.zeros(
+            self.num_actions, device=self.device, dtype=torch.float, requires_grad=False
+        )
+        self.obs: torch.Tensor = torch.zeros(self.num_obs, device=self.device, dtype=torch.float, requires_grad=False)
         self.obs_storage = torch.zeros(
             self.unit_obs * (self.observation_history_length - 1), device=self.device, dtype=torch.float
         )
@@ -353,7 +396,7 @@ class PolicyRunner:
         rx = struct.unpack("f", struct.pack("4B", *self.state.wirelessRemote[8:12]))
         # ry = struct.unpack('f', struct.pack('4B', *self.state.wirelessRemote[12:16]))
 
-        if self.server and not self.joystick:
+        if self.server:
             x, y, r = self.command_server.get()
             # clip out-of-bounds values:
             if abs(x) > 1:
@@ -416,51 +459,36 @@ class PolicyRunner:
         # self.lin_vel = self.aBody*0.001
         self.R = self.get_rotation_matrix_from_rpy(self.state.imu.rpy)
         self.gravity_vector = self.get_gravity_vector()
-        self.pitch = torch.tensor([self.state.imu.rpy[1]], device=self.device, dtype=torch.float, requires_grad=False)
-        self.roll = torch.tensor([self.state.imu.rpy[0]], device=self.device, dtype=torch.float, requires_grad=False)
+        self.pitch = self.state.imu.rpy[1]
+        self.roll = self.state.imu.rpy[0]
 
-        self.base_ang_vel = torch.tensor(
-            self.omegaBody[np.newaxis, :], device=self.device, dtype=torch.float, requires_grad=False
-        )
-        self.dof_pos = torch.tensor(
-            [m - n for m, n in zip(self.q, self.default_angles)],
-            device=self.device,
-            dtype=torch.float,
-            requires_grad=False,
-        )
-        self.projected_gravity = torch.tensor(
-            self.gravity_vector[np.newaxis, :], device=self.device, dtype=torch.float, requires_grad=False
-        )
-        self.commands = torch.tensor(
-            [forward, side, rotate], device=self.device, dtype=torch.float, requires_grad=False
-        )
-        self.dof_vel = torch.tensor(
-            [self.dq], device=self.device, dtype=torch.float, requires_grad=False
-        )  # 0.5 scale maximum
+        # Convert to numpy arrays for compatibility
+        base_ang_vel_np = np.array(self.omegaBody, dtype=np.float32)
+        dof_pos_np = np.array([m - n for m, n in zip(self.q, self.default_angles)], dtype=np.float32)
+        projected_gravity_np = np.array(self.gravity_vector, dtype=np.float32)
+        commands_np = np.array([forward, side, rotate], dtype=np.float32)
+        dof_vel_np = np.array(self.dq, dtype=np.float32)
+        actions_np = np.array(self.actions.detach().cpu().tolist(), dtype=np.float32)
 
-        if self.timestep % 50 == 0:
-            # print(f"base_ang_vel: {self.base_ang_vel}")
-            # print(f"projected_gravity: {self.projected_gravity}")
-            # print(f"commands: {self.commands}")
-            # print(f"dof_pos: {self.dof_pos}")
-            # print(f"dof_vel: {self.dof_vel}")
-            # print(f"actions: {self.actions}")
-            ...
+        # # Debugging output
+        # if self.timestep % 50 == 0:
+        #     print(f"base_ang_vel: {base_ang_vel_np}")
+        #     print(f"projected_gravity: {projected_gravity_np}")
+        #     print(f"commands: {commands_np}")
+        #     print(f"dof_pos: {dof_pos_np}")
+        #     print(f"dof_vel: {dof_vel_np}")
+        #     print(f"actions: {actions_np}")
 
-        self.obs = torch.cat(
-            (
-                # self.base_lin_vel.squeeze(),
-                self.base_ang_vel.squeeze(),
-                self.projected_gravity.squeeze(),
-                self.commands,
-                self.dof_pos,
-                self.dof_vel.squeeze(),
-                self.actions,
-            ),
-            dim=-1,
+        # Concatenate all observations as numpy array
+        obs_np = np.concatenate(
+            [base_ang_vel_np, projected_gravity_np, commands_np, dof_pos_np, dof_vel_np, actions_np], axis=0
         )
 
-        self.obs = torch.clip(self.obs, -100, 100)
+        # Clip observations
+        obs_np = np.clip(obs_np, -100, 100)
+
+        # Convert back to torch tensor for policy
+        self.obs = torch.from_numpy(obs_np).to(self.device)
 
         current_obs = self.obs
 
@@ -543,25 +571,15 @@ class PolicyRunner:
         else:
             # Use local policy
             self.actions = self.policy(self.obs)
-            
+
         actions = torch.clip(self.actions, -100, 100).to("cpu").detach()
 
         scaled_actions = actions * self.action_scale
         final_angles = scaled_actions + self.default_angles_tensor
         des_angles = scaled_actions + self.default_angles_tensor
-        # final_angles = self.default_angles_tensor
-        # print("actions:", scaled_actions.numpy().tolist())
 
         if self.init_log_data:
             self.leg_data_buffer.append([self.timestep] + self.q + des_angles.tolist())
-
-        # print("actions:" + ",".join(map(str, actions.numpy().tolist())))
-
-        # if self.timestep % 500 == 0:
-        #     ...
-        # print(f"Scaled actions: {scaled_actions.numpy().tolist()}")
-
-        # print("observations:" + str(time.process_time()) + ",".join(map(str, self.obs.detach().numpy().tolist())))
 
         # Send observations to controller (if server mode and client is connected)
         if self.server and self.command_server:
@@ -569,7 +587,6 @@ class PolicyRunner:
 
         # Send joint commands
         self.setJointValues(angles=final_angles, kp=20, kd=0.5)
-        # self.setJointValues(self.default_angles,kp=50,kd=5)
 
         self.post_step()
 
